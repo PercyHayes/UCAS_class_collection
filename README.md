@@ -51,3 +51,7 @@ UCAS_class_collection/
 
 ---
 *最后更新: 2025年6月28日*
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=PercyHayes/UCAS_class_collection&type=Date)](https://www.star-history.com/#PercyHayes/UCAS_class_collection&Date)
