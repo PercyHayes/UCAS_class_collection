@@ -1,0 +1,1 @@
+python train.py --imgsz 640 --batch 28 --epochs 3 --data coco.yaml --weights "" --cfg yolov5m.yaml --device mlu

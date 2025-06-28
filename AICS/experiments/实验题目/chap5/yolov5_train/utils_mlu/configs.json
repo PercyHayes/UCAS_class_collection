@@ -1,0 +1,19 @@
+{
+	"BENCHMARK_LOG" : [
+					"net",
+					"batch_size",
+					"cards",
+					"precision",
+					"DPF_mode",
+					"batch_time_avg",
+					"batch_time_var",
+					"hardware_time_avg",
+					"hardware_time_var",
+					"throughput"
+	], 
+
+	"AVG_LOG" : [
+					"net",
+					"accuracy"
+	]
+}

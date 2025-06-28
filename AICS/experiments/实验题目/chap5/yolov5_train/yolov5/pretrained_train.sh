@@ -1,0 +1,1 @@
+python train.py --batch 28 --epochs 1 --data coco.yaml --cfg yolov5m.yaml  --device mlu  --weights yolov5m.pt

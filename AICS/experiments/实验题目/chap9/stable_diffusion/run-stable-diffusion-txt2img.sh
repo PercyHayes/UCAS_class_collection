@@ -1,0 +1,1 @@
+python scripts/txt2img.py --prompt "a professional photograph of an astronaut riding a horse" --ckpt /workspace/model/favorite/large-scale-models/model-v1/stable_diffusion_ckpt/models/v2-1_768-nonema-pruned.ckpt --config configs/stable-diffusion/v2-inference-v.yaml --device mlu

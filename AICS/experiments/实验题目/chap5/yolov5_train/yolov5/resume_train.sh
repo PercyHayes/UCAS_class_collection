@@ -1,0 +1,1 @@
+python train.py --resume --batch 28 --data coco.yaml --cfg yolov5m.yaml  --device mlu  --weights ./runs/train/exp6/weights/last.pt

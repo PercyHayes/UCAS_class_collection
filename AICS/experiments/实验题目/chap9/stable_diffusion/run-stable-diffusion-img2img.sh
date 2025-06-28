@@ -1,0 +1,1 @@
+python3 scripts/img2img.py --prompt "A fantasy landscape, trending on artstation" --init-img ./outputs/txt2img-samples/samples/00003.png --strength 0.8 --ckpt /workspace/model/favorite/large-scale-models/model-v1/stable_diffusion_ckpt/models/v2-1_768-nonema-pruned.ckpt --config configs/stable-diffusion/v2-inference-v.yaml

@@ -1,0 +1,317 @@
+diff --git a/train.py b/train.py
+index 29ae43e..656c001 100644
+--- a/train.py
++++ b/train.py
+@@ -44,18 +44,22 @@ from utils.downloads import attempt_download
+ from utils.loss import ComputeLoss
+ from utils.plots import plot_labels, plot_evolve
+ from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, intersect_dicts, select_device, \
+-    torch_distributed_zero_first
++    torch_distributed_zero_first, is_device_available
+ from utils.loggers.wandb.wandb_utils import check_wandb_resume
+ from utils.metrics import fitness
+ from utils.loggers import Loggers
+ from utils.callbacks import Callbacks
+ 
++# benchmark
++cur_dir = os.path.dirname(os.path.abspath(__file__))
++sys.path.append(cur_dir + "/../utils_mlu/")
++from metric import MetricCollector
++
+ LOGGER = logging.getLogger(__name__)
+ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+ RANK = int(os.getenv('RANK', -1))
+ WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+ 
+-
+ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+           opt,
+           device,
+@@ -97,7 +101,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+ 
+     # Config
+     plots = not evolve  # create plots
+-    cuda = device.type != 'cpu'
++    use_device = device.type in ['cuda', 'mlu']
+     init_seeds(1 + RANK)
+     with torch_distributed_zero_first(LOCAL_RANK):
+         data_dict = data_dict or check_dataset(data)  # check if None
+@@ -113,7 +117,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+     if pretrained:
+         with torch_distributed_zero_first(LOCAL_RANK):
+             weights = attempt_download(weights)  # download if not found locally
+-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
++        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint
+         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+@@ -196,13 +200,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+ 
+     # DP mode
+-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
++    cuda = (device.type=='cuda')
++    if cuda and RANK == -1 and torch.cuda.device_count()  > 1:
+         logging.warning('DP not recommended, instead use torch.distributed.run for best DDP Multi-GPU results.\n'
+                         'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
+         model = torch.nn.DataParallel(model)
+ 
+     # SyncBatchNorm
+-    if opt.sync_bn and cuda and RANK != -1:
++    if opt.sync_bn and use_device and RANK != -1:
+         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+         LOGGER.info('Using SyncBatchNorm()')
+ 
+@@ -238,7 +243,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+         callbacks.run('on_pretrain_routine_end')
+ 
+     # DDP mode
+-    if cuda and RANK != -1:
++    if use_device and RANK != -1:
+         model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+ 
+     # Model parameters
+@@ -259,13 +264,25 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+     maps = np.zeros(nc)  # mAP per class
+     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+     scheduler.last_epoch = start_epoch - 1  # do not move
+-    scaler = amp.GradScaler(enabled=cuda)
++    use_amp = (device.type == 'cuda' or opt.pyamp)
++    scaler = amp.GradScaler(enabled=use_amp)
++
+     stopper = EarlyStopping(patience=opt.patience)
+     compute_loss = ComputeLoss(model)  # init loss class
+     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
+                 f'Using {train_loader.num_workers} dataloader workers\n'
+                 f"Logging results to {colorstr('bold', save_dir)}\n"
+                 f'Starting training for {epochs} epochs...')
++
++    metric_collector = MetricCollector(
++        enable_only_benchmark=True,
++        record_elapsed_time=True,
++        record_hardware_time=True if opt.device == 'mlu' else False)
++    if opt.iters != -1:
++        epochs = start_epoch + math.ceil(opt.iters*1.0 / len(train_loader))
++        iters = opt.iters
++    metric_collector.place()
++
+     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+         model.train()
+ 
+@@ -283,7 +300,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+         if RANK != -1:
+             train_loader.sampler.set_epoch(epoch)
+         pbar = enumerate(train_loader)
+-        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
++        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'mlu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
+         if RANK in [-1, 0]:
+             pbar = tqdm(pbar, total=nb)  # progress bar
+         optimizer.zero_grad()
+@@ -311,7 +328,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+ 
+             # Forward
+-            with amp.autocast(enabled=cuda):
++            with amp.autocast(enabled=use_amp):
+                 pred = model(imgs)  # forward
+                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                 if RANK != -1:
+@@ -334,7 +351,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+             # Log
+             if RANK in [-1, 0]:
+                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+-                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
++                mem = f'{torch.mlu.memory_reserved() / 1E9 if torch.mlu.is_available() else 0:.3g}G'  # (GB)
+                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
+                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, opt.sync_bn)
+@@ -349,7 +366,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+             callbacks.run('on_train_epoch_end', epoch=epoch)
+             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
+-            if not noval or final_epoch:  # Calculate mAP
++            if (not noval or final_epoch) and not opt.skip:  # Calculate mAP
+                 results, maps, _ = val.run(data_dict,
+                                            batch_size=batch_size // WORLD_SIZE * 2,
+                                            imgsz=imgsz,
+@@ -369,7 +386,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+ 
+             # Save model
+-            if (not nosave) or (final_epoch and not evolve):  # if save
++            if ((not nosave) or (final_epoch and not evolve)) and not opt.skip:  # if save
+                 ckpt = {'epoch': epoch,
+                         'best_fitness': best_fitness,
+                         'model': deepcopy(de_parallel(model)).half(),
+@@ -382,7 +399,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+                 torch.save(ckpt, last)
+                 if best_fitness == fi:
+                     torch.save(ckpt, best)
+-                if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
++                if (epoch > 0) and (opt.save_period > 0) and ((epoch + 1) % opt.save_period == 0):
+                     torch.save(ckpt, w / f'epoch{epoch}.pt')
+                 del ckpt
+                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+@@ -404,11 +421,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
+         # end epoch ----------------------------------------------------------------------------------------------------
+     # end training -----------------------------------------------------------------------------------------------------
+     if RANK in [-1, 0]:
++        # insert metrics and dump metrics
++        metric_collector.insert_metrics(
++            net = "YOLOv5x_v6.0",
++            batch_size = int(opt.batch_size) // WORLD_SIZE,
++            precision = "amp" if opt.pyamp else "fp32",
++            cards = WORLD_SIZE,
++            DPF_mode = "ddp " if WORLD_SIZE > 1 else "single")
++        metric_collector.dump()
++
+         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+         for f in last, best:
+             if f.exists():
+                 strip_optimizer(f)  # strip optimizers
+-                if f is best:
++                if f is best and device.type != 'mlu':
+                     LOGGER.info(f'\nValidating {f}...')
+                     results, _, _ = val.run(data_dict,
+                                             batch_size=batch_size // WORLD_SIZE * 2,
+@@ -449,7 +475,7 @@ def parse_opt(known=False):
+     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
+     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
+     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
+-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
++    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu; mlu')
+     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
+     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
+     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
+@@ -465,6 +491,9 @@ def parse_opt(known=False):
+     parser.add_argument('--freeze', type=int, default=0, help='Number of layers to freeze. backbone=10, all=24')
+     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
+     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
++    parser.add_argument('--pyamp', action='store_true', help='using amp for mixed precision training')
++    parser.add_argument('--iters', type=int, default=-1, help="Total iters for benchmark.")
++    parser.add_argument('--skip', action='store_true', help='skip val or save pt.')
+ 
+     # Weights & Biases arguments
+     parser.add_argument('--entity', default=None, help='W&B: Entity')
+@@ -501,16 +530,28 @@ def main(opt, callbacks=Callbacks()):
+             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
+         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+ 
++    if opt.device == 'mlu':
++        print(is_device_available)
++        assert is_device_available['mlu'], ""
++        device = torch.device('mlu')
++    else:
++        device = select_device(opt.device, batch_size=opt.batch_size)
++
+     # DDP mode
+-    device = select_device(opt.device, batch_size=opt.batch_size)
+     if LOCAL_RANK != -1:
+-        assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
+         assert opt.batch_size % WORLD_SIZE == 0, '--batch-size must be multiple of CUDA device count'
+         assert not opt.image_weights, '--image-weights argument is not compatible with DDP training'
+         assert not opt.evolve, '--evolve argument is not compatible with DDP training'
+-        torch.cuda.set_device(LOCAL_RANK)
+-        device = torch.device('cuda', LOCAL_RANK)
+-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
++        if is_device_available['cuda']:
++            assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
++            torch.cuda.set_device(LOCAL_RANK)
++            device = torch.device('cuda', LOCAL_RANK)
++            dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
++        elif is_device_available['mlu']:
++            #assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
++            torch.mlu.set_device(LOCAL_RANK)
++            device = torch.device('mlu', LOCAL_RANK)
++            dist.init_process_group(backend="cncl", init_method="env://")
+ 
+     # Train
+     if not opt.evolve:
+diff --git a/utils/torch_utils.py b/utils/torch_utils.py
+index 352ecf5..fd97b42 100644
+--- a/utils/torch_utils.py
++++ b/utils/torch_utils.py
+@@ -27,6 +27,10 @@ except ImportError:
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
++is_device_available = {
++        'cuda': torch.cuda.is_available(),
++        'mlu' : hasattr(torch, 'is_mlu_available') and torch.is_mlu_available()
++    }
+ 
+ @contextmanager
+ def torch_distributed_zero_first(local_rank: int):
+@@ -34,10 +38,16 @@ def torch_distributed_zero_first(local_rank: int):
+     Decorator to make all processes in distributed training wait for each local_master to do something.
+     """
+     if local_rank not in [-1, 0]:
+-        dist.barrier(device_ids=[local_rank])
++        if is_device_available['mlu']:
++            dist.barrier()
++        else:
++            dist.barrier(device_ids=[local_rank])
+     yield
+     if local_rank == 0:
+-        dist.barrier(device_ids=[0])
++        if is_device_available['mlu']:
++            dist.barrier()
++        else:
++            dist.barrier(device_ids=[0])
+ 
+ 
+ def date_modified(path=__file__):
+diff --git a/val.py b/val.py
+index 2fc5473..b22b1b6 100644
+--- a/val.py
++++ b/val.py
+@@ -30,10 +30,9 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_img_size,
+     increment_path, colorstr, print_args
+ from utils.metrics import ap_per_class, ConfusionMatrix
+ from utils.plots import output_to_target, plot_images, plot_val_study
+-from utils.torch_utils import select_device, time_sync
++from utils.torch_utils import select_device, time_sync, is_device_available
+ from utils.callbacks import Callbacks
+ 
+-
+ def save_one_txt(predn, save_conf, shape, file):
+     # Save one txt result
+     gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
+@@ -113,7 +112,10 @@ def run(data,
+         device = next(model.parameters()).device  # get model device
+ 
+     else:  # called directly
+-        device = select_device(device, batch_size=batch_size)
++        if is_device_available['mlu']:
++            device = torch.device('mlu')
++        else:
++            device = select_device(device, batch_size=batch_size)
+ 
+         # Directories
+         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+@@ -121,7 +123,7 @@ def run(data,
+ 
+         # Load model
+         check_suffix(weights, '.pt')
+-        model = attempt_load(weights, map_location=device)  # load FP32 model
++        model = attempt_load(weights, map_location='cpu')  # load FP32 model
+         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+         imgsz = check_img_size(imgsz, s=gs)  # check image size
+ 
+@@ -146,6 +148,7 @@ def run(data,
+     # Dataloader
+     if not training:
+         if device.type != 'cpu':
++            model = model.to(device)
+             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+         pad = 0.0 if task == 'speed' else 0.5
+         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
+@@ -306,7 +309,7 @@ def parse_opt():
+     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
+     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
+     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
+-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
++    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3; cpu; mlu')
+     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
+     parser.add_argument('--augment', action='store_true', help='augmented inference')
+     parser.add_argument('--verbose', action='store_true', help='report mAP by class')
