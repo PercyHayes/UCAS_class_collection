@@ -1,6 +1,8 @@
 # 国科大人工智能课程资料集合 📚
+![GitHub Repo stars](https://img.shields.io/github/stars/PercyHayes/UCAS_class_collection?style=social)
 
 > 中国科学院大学人工智能专业硕博课程学习资料集合
+
 
 ## 🎯 项目简介
 
@@ -51,7 +53,3 @@ UCAS_class_collection/
 
 ---
 *最后更新: 2025年6月28日*
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=PercyHayes/UCAS_class_collection&type=Date)](https://www.star-history.com/#PercyHayes/UCAS_class_collection&Date)
